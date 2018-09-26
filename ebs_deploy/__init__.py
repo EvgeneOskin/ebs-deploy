@@ -1,3 +1,4 @@
+from os import environ
 from boto.exception import S3ResponseError
 from boto.s3.connection import S3Connection
 from boto.beanstalk import connect_to_region
@@ -198,7 +199,7 @@ def add_config_files_to_archive(directory, filename, config={}):
                     content = tree.get('content', '')
                 out("Adding file " + str(conf) + " to archive " + str(filename))
                 file_entry = zipfile.ZipInfo(conf)
-                file_entry.external_attr = tree.get('permissions', 0o644) << 16 
+                file_entry.external_attr = tree.get('permissions', 0o644) << 16
                 zip_file.writestr(file_entry, content)
 
     return filename
@@ -234,8 +235,8 @@ class EbsHelper(object):
                                      aws_secret_access_key=aws.secret_key,
                                      security_token=aws.security_token)
         self.s3 = S3Connection(
-            aws_access_key_id=aws.access_key, 
-            aws_secret_access_key=aws.secret_key, 
+            aws_access_key_id=aws.access_key,
+            aws_secret_access_key=aws.secret_key,
             security_token=aws.security_token,
             host=(lambda r: 's3.amazonaws.com' if r == 'us-east-1' else 's3-' + r + '.amazonaws.com')(aws.region))
         self.app_name = app_name
@@ -489,7 +490,7 @@ class EbsHelper(object):
                 break
 
             # wait
-            sleep(10)
+            sleep(int(environ.get('EBS_DEPLOY_WAIT_SECONDS', 10)))
 
             # # get the env
             environments = self.ebs.describe_environments(

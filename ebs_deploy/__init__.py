@@ -1,7 +1,5 @@
-from boto.exception import S3ResponseError
-from boto.s3.connection import S3Connection
-from boto.beanstalk import connect_to_region
-from boto.s3.key import Key
+import boto3
+from botocore.exceptions import ClientError as BotoClientError
 
 from datetime import datetime
 from time import time, sleep
@@ -198,7 +196,7 @@ def add_config_files_to_archive(directory, filename, config={}):
                     content = tree.get('content', '')
                 out("Adding file " + str(conf) + " to archive " + str(filename))
                 file_entry = zipfile.ZipInfo(conf)
-                file_entry.external_attr = tree.get('permissions', 0o644) << 16 
+                file_entry.external_attr = tree.get('permissions', 0o644) << 16
                 zip_file.writestr(file_entry, content)
 
     return filename
@@ -230,14 +228,17 @@ class EbsHelper(object):
         Creates the EbsHelper
         """
         self.aws = aws
-        self.ebs = connect_to_region(aws.region, aws_access_key_id=aws.access_key,
-                                     aws_secret_access_key=aws.secret_key,
-                                     security_token=aws.security_token)
-        self.s3 = S3Connection(
-            aws_access_key_id=aws.access_key, 
-            aws_secret_access_key=aws.secret_key, 
-            security_token=aws.security_token,
-            host=(lambda r: 's3.amazonaws.com' if r == 'us-east-1' else 's3-' + r + '.amazonaws.com')(aws.region))
+        self.ebs = boto3.client('elasticbeanstalk', region_name=aws.region, aws_access_key_id=aws.access_key,
+                                aws_secret_access_key=aws.secret_key,
+                                aws_session_token=aws.security_token)
+        self.s3 = boto3.resource(
+            's3',
+            aws_access_key_id=aws.access_key,
+            aws_secret_access_key=aws.secret_key,
+            aws_session_token=aws.security_token,
+            region_name=aws.region
+        )
+
         self.app_name = app_name
         self.wait_time_secs = wait_time_secs
 
@@ -245,22 +246,27 @@ class EbsHelper(object):
         """
         Swaps cnames for an environment
         """
-        self.ebs.swap_environment_cnames(source_environment_name=from_env_name,
-                                         destination_environment_name=to_env_name)
+        self.ebs.swap_environment_cnames(SourceEnvironmentName=from_env_name,
+                                         DestinationEnvironmentName=to_env_name)
 
     def upload_archive(self, filename, key, auto_create_bucket=True):
         """
         Uploads an application archive version to s3
         """
         try:
-            bucket = self.s3.get_bucket(self.aws.bucket)
+            bucket = self.s3.Bucket(self.aws.bucket)
+            s3_client = boto3.client("s3", region_name=self.aws.region)
+            bucket_location = s3_client.get_bucket_location(Bucket=self.aws.bucket)['LocationConstraint']
             if ((
-                  self.aws.region != 'us-east-1' and self.aws.region != 'eu-west-1') and bucket.get_location() != self.aws.region) or (
-                  self.aws.region == 'us-east-1' and bucket.get_location() != '') or (
-                  self.aws.region == 'eu-west-1' and bucket.get_location() != 'eu-west-1'):
-                raise Exception("Existing bucket doesn't match region")
-        except S3ResponseError:
-            bucket = self.s3.create_bucket(self.aws.bucket, location=self.aws.region)
+                  self.aws.region != 'us-east-1' and self.aws.region != 'eu-west-1') and bucket_location != self.aws.region) or (
+                  self.aws.region == 'us-east-1' and bucket_location != '') or (
+                  self.aws.region == 'eu-west-1' and bucket_location != 'eu-west-1'):
+                raise Exception("Existing bucket doesn't match region: " + self.aws.region + ' ' + bucket_location)
+        except BotoClientError:
+            bucket = self.s3.Bucket(self.aws.bucket)
+            bucket.create(CreateBucketConfiguration={
+                'LocationConstraint': self.aws.region
+            })
 
         def __report_upload_progress(sent, total):
             if not sent:
@@ -271,10 +277,9 @@ class EbsHelper(object):
                 + " (" + str(int(float(max(1, sent)) / float(total) * 100)) + "%)")
 
         # upload the new version
-        k = Key(bucket)
-        k.key = self.aws.bucket_path + key
-        k.set_metadata('time', str(time()))
-        k.set_contents_from_filename(filename, cb=__report_upload_progress, num_cb=10)
+        k = bucket.Object(self.aws.bucket_path + key)
+        with open(filename, 'rb') as _file:
+            k.put(_file, Metadata={'time': str(time())})
 
     def list_available_solution_stacks(self):
         """
@@ -289,7 +294,7 @@ class EbsHelper(object):
         app_name to the created application
         """
         out("Creating application " + str(self.app_name))
-        self.ebs.create_application(self.app_name, description=description)
+        self.ebs.create_application(ApplicationName=self.app_name, Description=description)
 
     def delete_application(self):
         """
@@ -297,7 +302,7 @@ class EbsHelper(object):
         app_name to the created application
         """
         out("Deleting application " + str(self.app_name))
-        self.ebs.delete_application(self.app_name, terminate_env_by_force=True)
+        self.ebs.delete_application(ApplicationName=self.app_name, TerminateEnvByForce=True)
 
     def application_exists(self):
         """
@@ -344,14 +349,14 @@ class EbsHelper(object):
         """
         Returns the environments
         """
-        response = self.ebs.describe_environments(application_name=self.app_name, include_deleted=False)
+        response = self.ebs.describe_environments(ApplicationName=self.app_name, IncludeDeleted=False)
         return response['DescribeEnvironmentsResponse']['DescribeEnvironmentsResult']['Environments']
 
     def delete_environment(self, environment_name):
         """
         Deletes an environment
         """
-        self.ebs.terminate_environment(environment_name=environment_name, terminate_resources=True)
+        self.ebs.terminate_environment(EnvironmentName=environment_name, TerminateResources=True)
 
     def update_environment(self, environment_name, description=None, option_settings=[], tier_type=None, tier_name=None,
                            tier_version='1.0'):
@@ -359,8 +364,8 @@ class EbsHelper(object):
         Updates an application version
         """
         out("Updating environment: " + str(environment_name))
-        messages = self.ebs.validate_configuration_settings(self.app_name, option_settings,
-                                                            environment_name=environment_name)
+        messages = self.ebs.validate_configuration_settings(ApplicationName=self.app_name, OptionSettings=option_settings,
+                                                            EnvironmentName=environment_name)
         messages = messages['ValidateConfigurationSettingsResponse']['ValidateConfigurationSettingsResult']['Messages']
         ok = True
         for message in messages:
@@ -369,12 +374,12 @@ class EbsHelper(object):
             out("[" + message['Severity'] + "] " + str(environment_name) + " - '" \
                 + message['Namespace'] + ":" + message['OptionName'] + "': " + message['Message'])
         self.ebs.update_environment(
-            environment_name=environment_name,
-            description=description,
-            option_settings=option_settings,
-            tier_type=tier_type,
-            tier_name=tier_name,
-            tier_version=tier_version)
+            EnvironmentName=environment_name,
+            Description=description,
+            OptionSettings=option_settings,
+            TierType=tier_type,
+            TierName=tier_name,
+            TierVersion=tier_version)
 
     def environment_name_for_cname(self, env_cname):
         """
@@ -394,13 +399,13 @@ class EbsHelper(object):
         Deploys a version to an environment
         """
         out("Deploying " + str(version_label) + " to " + str(environment_name))
-        self.ebs.update_environment(environment_name=environment_name, version_label=version_label)
+        self.ebs.update_environment(EnvironmentName=environment_name, VersionLabel=version_label)
 
     def get_versions(self):
         """
         Returns the versions available
         """
-        response = self.ebs.describe_application_versions(application_name=self.app_name)
+        response = self.ebs.describe_application_versions(ApplicationName=self.app_name)
         return response['DescribeApplicationVersionsResponse']['DescribeApplicationVersionsResult']['ApplicationVersions']
 
     def create_application_version(self, version_label, key):
@@ -408,8 +413,8 @@ class EbsHelper(object):
         Creates an application version
         """
         out("Creating application version " + str(version_label) + " for " + str(key))
-        self.ebs.create_application_version(self.app_name, version_label,
-                                            s3_bucket=self.aws.bucket, s3_key=self.aws.bucket_path+key)
+        self.ebs.create_application_version(ApplicationName=self.app_name, VersionLabel=version_label,
+                                            S3Bucket=self.aws.bucket, S3Key=self.aws.bucket_path+key)
 
     def delete_unused_versions(self, versions_to_keep=10):
         """
@@ -417,17 +422,17 @@ class EbsHelper(object):
         """
 
         # get versions in use
-        environments = self.ebs.describe_environments(application_name=self.app_name, include_deleted=False)
+        environments = self.ebs.describe_environments(ApplicationName=self.app_name, IncludeDeleted=False)
         environments = environments['DescribeEnvironmentsResponse']['DescribeEnvironmentsResult']['Environments']
         versions_in_use = []
         for env in environments:
             versions_in_use.append(env['VersionLabel'])
 
         # get all versions
-        versions = self.ebs.describe_application_versions(application_name=self.app_name)
+        versions = self.ebs.describe_application_versions(ApplicationName=self.app_name)
         versions = versions['DescribeApplicationVersionsResponse']['DescribeApplicationVersionsResult'][
             'ApplicationVersions']
-        versions = sorted(versions, reverse=True, key=functools.cmp_to_key(lambda x, y: (x['DateCreated'] > y['DateCreated']) - (x['DateCreated'] < y['DateCreated'])))
+        versions = sorted(versions, reverse=True, cmp=lambda x, y: cmp(x['DateCreated'], y['DateCreated']))
 
         # delete versions in use
         for version in versions[versions_to_keep:]:
@@ -435,8 +440,8 @@ class EbsHelper(object):
                 out("Not deleting " + version["VersionLabel"] + " because it is in use")
             else:
                 out("Deleting unused version: " + version["VersionLabel"])
-                self.ebs.delete_application_version(application_name=self.app_name,
-                                                    version_label=version['VersionLabel'])
+                self.ebs.delete_application_version(ApplicationName=self.app_name,
+                                                    VersionLabel=version['VersionLabel'])
                 sleep(2)
 
     def describe_events(self, environment_name, next_token=None, start_time=None):
@@ -444,10 +449,10 @@ class EbsHelper(object):
         Describes events from the given environment
         """
         events = self.ebs.describe_events(
-            application_name=self.app_name,
-            environment_name=environment_name,
-            next_token=next_token,
-            start_time=start_time + 'Z')
+            ApplicationName=self.app_name,
+            EnvironmentName=environment_name,
+            NextToken=next_token,
+            StartTime=start_time)
 
         return (events['DescribeEventsResponse']['DescribeEventsResult']['Events'], events['DescribeEventsResponse']['DescribeEventsResult']['NextToken'])
 
@@ -489,13 +494,13 @@ class EbsHelper(object):
                 break
 
             # wait
-            sleep(10)
+            sleep(5)
 
             # # get the env
             environments = self.ebs.describe_environments(
-                application_name=self.app_name,
-                environment_names=environment_names,
-                include_deleted=include_deleted)
+                ApplicationName=self.app_name,
+                EnvironmentNames=environment_names,
+                IncludeDeleted=include_deleted)
 
             environments = environments['DescribeEnvironmentsResponse']['DescribeEnvironmentsResult']['Environments']
             if len(environments) <= 0:
